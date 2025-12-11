@@ -592,6 +592,16 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
 
         @register(torch.ops.inductor.accumulate_grad_.default)
         def handle_accumulate_grad_(self, tx: "InstructionTranslator", *args, **kwargs):
+            # Check if gradient is sparse - sparse gradients are not supported
+            if len(args) >= 2:
+                grad_var = args[1]
+                if getattr(grad_var, "is_sparse", False):
+                    unimplemented(
+                        gb_type="sparse_grad_accumulate_grad",
+                        context="accumulate_grad_ with sparse gradient",
+                        explanation="Sparse gradients are not supported in compiled autograd",
+                        hints=[],
+                    )
             return tx.inline_user_function_return(
                 VariableTracker.build(tx, polyfills.accumulate_grad), args, kwargs
             )
@@ -1502,7 +1512,7 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             if compiled_autograd.compiled_autograd_enabled:
                 unimplemented(
                     gb_type="autograd.grad with compiled autograd",
-                    context="",
+                    context="torch.autograd.grad()",
                     explanation=(
                         "torch.autograd.grad() inside torch.compile is not supported when "
                         "compiled autograd is enabled."
