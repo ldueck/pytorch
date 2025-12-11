@@ -231,6 +231,29 @@ class VariableTrackerCache:
         self.cache.clear()
 
 
+def fx_node_reachable(
+    start_node: fx.Node, target_nodes: set[fx.Node], visited: set[fx.Node]
+) -> bool:
+    """Check if any target node is reachable from start_node by traversing args backwards."""
+    if start_node in visited:
+        return False
+    visited.add(start_node)
+
+    if start_node in target_nodes:
+        return True
+
+    def check_arg(arg: Any) -> bool:
+        if isinstance(arg, fx.Node):
+            return fx_node_reachable(arg, target_nodes, visited)
+        if isinstance(arg, (list, tuple)):
+            return any(check_arg(item) for item in arg)
+        return False
+
+    return any(check_arg(arg) for arg in start_node.args) or any(
+        check_arg(v) for v in start_node.kwargs.values()
+    )
+
+
 @functools.cache
 def _step_logger() -> Any:
     return torchdynamo_logging.get_step_logger(log)
@@ -675,6 +698,18 @@ class OutputGraph(OutputGraphCommon):
         # allow_in_graph, they would like to see the error instead of falling
         # back for backend errors.
         self.has_user_defined_allowed_in_graph = False
+
+        # Tracks which input sources have been checked for external grad_fn
+        # when autograd.grad is used. This avoids re-checking the same sources.
+        self.autograd_grad_checked_sources: set[Source] = set()
+
+        # Tracks the FX nodes created by torch.autograd.grad calls.
+        # Used to check if outputs are connected to autograd.grad computations.
+        self.autograd_grad_nodes: set[torch.fx.Node] = set()
+
+        # Tracks FX nodes passed as the `outputs` arg to torch.autograd.grad.
+        # These tensors have had their grad_fn consumed and shouldn't be returned.
+        self.autograd_grad_output_nodes: set[torch.fx.Node] = set()
 
         # Tracks a list of called ops that were not tagged with "pt2_compliant_tag".
         # This information is useful for logging.
@@ -2073,6 +2108,44 @@ class OutputGraph(OutputGraphCommon):
             tx.speculation_log.clear()
             raise exc.CompileCollectiveRestartAnalysis
 
+    def _validate_outputs_safe_for_autograd_nodes(
+        self, rv: list["VariableTracker"]
+    ) -> None:
+        """
+        Validate that if torch.autograd.grad is used in the graph and outputs
+        require grad, we trigger a graph break only if the output is connected
+        to the autograd.grad computation.
+
+        This is because aot_autograd will try to trace backward through the outputs,
+        which will fail with a confusing error about "backward through graph a second time".
+        """
+        if not self.autograd_grad_nodes:
+            return
+
+        from . import graph_break_hints
+        from .variables.tensor import TensorVariable
+
+        for var in rv:
+            if not isinstance(var, TensorVariable) or not var.requires_grad:
+                continue
+
+            output_node = var.proxy.node
+            is_autograd_grad_output = output_node in self.autograd_grad_output_nodes
+            is_derived = fx_node_reachable(output_node, self.autograd_grad_nodes, set())
+
+            if is_derived or is_autograd_grad_output:
+                unimplemented(
+                    gb_type="autograd.grad with output that requires grad",
+                    context="",
+                    explanation=(
+                        "torch.compile with aot_autograd does not currently support double backward. "
+                        "The compiled function uses torch.autograd.grad() and returns a tensor that "
+                        "is connected to the autograd.grad() call, which would require tracing "
+                        "backward through the graph a second time."
+                    ),
+                    hints=[*graph_break_hints.USER_ERROR],
+                )
+
     def compile_and_call_fx_graph(
         self,
         tx: "InstructionTranslatorBase",
@@ -2099,6 +2172,10 @@ class OutputGraph(OutputGraphCommon):
 
             assert isinstance(rv, list)
             assert isinstance(root, FakeRootModule)
+
+            # Check if autograd.grad is used with outputs that require grad
+            # This would cause double backward issues in aot_autograd
+            self._validate_outputs_safe_for_autograd_nodes(rv)
 
             output_node = self.create_node(
                 "output",
@@ -2728,6 +2805,7 @@ class OutputGraph(OutputGraphCommon):
         self.register_finalizer_fns.clear()
         self.dynamo_flat_name_to_original_fqn.clear()
         self.tracing_context.clear()
+        self.autograd_grad_checked_sources.clear()
         self.input_source_to_var.clear()
         self.unspec_variable_map.clear()
         self.backward_state.clear()
