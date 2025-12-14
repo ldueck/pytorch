@@ -181,6 +181,8 @@ else:
         _root_mesh: Optional["DeviceMesh"] = None
         # Record flatten mesh name to its flattened mesh in root mesh.
         _flatten_mapping: dict[str, "DeviceMesh"]
+        # Flag to specify whether to use torchComms backend or not for a device mesh.
+        _use_torchcomm = False
 
         def __init__(
             self,
@@ -278,6 +280,7 @@ else:
                         self._rank_map,
                         self._mesh_dim_names,
                         backend_override,
+                        self._use_torchcomm,
                     )
 
                 if is_initialized() and get_backend() == "threaded":
@@ -379,6 +382,7 @@ else:
             rank_map: torch.Tensor,
             dim_name: str,
             backend_override: BackendConfig,
+            _use_torchcomm: bool = False,
         ) -> GroupName | None:
             # Generate a 2D global mesh tensor for the current dim for PG creation.
             pg_ranks_by_dim = sub_layout.nest().remap_to_tensor(rank_map)
@@ -410,6 +414,7 @@ else:
                         backend="cpu:gloo,cuda:nccl",
                         ranks=ranks,
                         group_desc="mesh_default",
+                        _use_torchcomm=_use_torchcomm,
                     )
                     if torch.cuda.is_available()
                     and get_backend(default_group) == "gloo"
@@ -456,6 +461,7 @@ else:
                     backend=backend,
                     pg_options=pg_options,
                     group_desc=group_desc,
+                    _use_torchcomm=_use_torchcomm,
                 )
 
                 # only add to dim_groups if the current rank in the subgroup
@@ -474,6 +480,7 @@ else:
             rank_map: torch.Tensor,
             mesh_dim_names: tuple[str, ...] | None,
             backend_override: tuple[BackendConfig, ...],
+            _use_torchcomm: bool = False,
         ) -> list[GroupName]:
             # group_name associated with each mesh dimension, each
             # mesh dimension should have one sub-group per rank
@@ -483,7 +490,7 @@ else:
                 dim_name = mesh_dim_names[dim] if mesh_dim_names else f"dim_{dim}"
                 dim_group_names.append(
                     DeviceMesh._init_one_process_group(
-                        layout[dim], rank_map, dim_name, backend_override[dim]
+                        layout[dim], rank_map, dim_name, backend_override[dim], _use_torchcomm
                     )
                 )
             # Filter out None values. If any are None then they should all be None.
@@ -1135,6 +1142,7 @@ else:
                     root_mesh._rank_map,
                     mesh_dim_names,
                     backend_override,
+                    self._use_torchcomm,
                 )
                 res_mesh._dim_group_names = dim_group_names
 
