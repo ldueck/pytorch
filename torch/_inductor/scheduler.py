@@ -3900,11 +3900,17 @@ class Scheduler:
             # Eagerly compile and benchmark non-template nodes
             choice_timings = multi_node.choice_timings()
             _, ms1 = multi_node.get_min_choice()
-            ms2, path2 = (
-                self.benchmark_fused_nodes(node_list_2)
-                if epilogue_fusion
-                else self.benchmark_fused_nodes(node_list_1)
-            )
+
+            ms2 = float("inf")
+            bench_epilogue = config.benchmark_epilogue_fusion
+            if bench_epilogue:
+                ms2, path2 = (
+                    self.benchmark_fused_nodes(node_list_2)
+                    if epilogue_fusion
+                    else self.benchmark_fused_nodes(node_list_1)
+                )
+            else:
+                epilogue_runtime = sum(n._get_estimated_runtime() for n in node_list_2)
 
             # Start compiling choices in parallel
             future_choices: list[tuple[Any, Optional[LambdaFuture], ModuleType]] = []
@@ -3927,7 +3933,7 @@ class Scheduler:
                 ):
                     continue
 
-                if unfused_time >= ms1 + ms2:
+                if bench_epilogue and unfused_time >= ms1 + ms2:
                     break
 
                 triton_choices += 1
@@ -3943,13 +3949,17 @@ class Scheduler:
             def benchmark_when_ready() -> bool:
                 min_ms_fused = float("inf")
                 ms_fused_choice = None
+                res = None
 
                 new_timings = {}
                 # Benchmark each choice after compilation completes
                 for choice, future, mod_fused in future_choices:
                     try:
                         if future is not None:
-                            future.result()
+                            res = future.result()
+                        elif not bench_epilogue:
+                            res = mod_fused.triton_
+                            res.precompile()
 
                     # Ideally we would more narrowly catch Exceptions here but
                     # triton  will unpredictably error with valid prologue fusions
@@ -3961,21 +3971,45 @@ class Scheduler:
                                 str(e),
                             )
                         continue
-                    # pyrefly: ignore [missing-attribute]
-                    with multi_node.swap_as_triton_caller(choice):
-                        ms_fused, path = self.benchmark_codegened_module(
-                            mod_fused,
-                            # pyrefly: ignore [bad-argument-type]
-                            device,
-                        )
-                        new_timings[choice] = ms_fused
-                        if ms_fused < min_ms_fused:
-                            min_ms_fused = ms_fused
+
+                    if bench_epilogue:
+                        # pyrefly: ignore [missing-attribute]
+                        with multi_node.swap_as_triton_caller(choice):
+                            ms_fused, path = self.benchmark_codegened_module(
+                                mod_fused,
+                                # pyrefly: ignore [bad-argument-type]
+                                device,
+                            )
+                            new_timings[choice] = ms_fused
+                            if ms_fused < min_ms_fused:
+                                min_ms_fused = ms_fused
+                                ms_fused_choice = choice
+                    else:
+                        # pyrefly: ignore [missing-attribute]
+                        min_choice, ms_min_choice = multi_node.get_min_choice()
+                        # pyrefly: ignore [missing-attribute]
+                        choice_timings = multi_node.choice_timings()
+                        if (
+                            res
+                            # pyrefly: ignore [missing-attribute]
+                            and len(res.launchers) == 1
+                            # pyrefly: ignore [missing-attribute]
+                            and res.launchers[0].n_spills <= 8
+                            and (
+                                min_choice == choice
+                                or epilogue_runtime + ms_min_choice
+                                > choice_timings[choice]
+                            )
+                        ):
                             ms_fused_choice = choice
+                            break
 
-                log_fusion(min_ms_fused, ms1, ms2)
+                if bench_epilogue:
+                    log_fusion(min_ms_fused, ms1, ms2)
 
-                if min_ms_fused < (ms1 + ms2) and ms_fused_choice is not None:
+                if (
+                    not bench_epilogue or min_ms_fused < (ms1 + ms2)
+                ) and ms_fused_choice is not None:
                     if config.multi_kernel_hints:
                         hint_override_best_fusion_choice[None] = ms_fused_choice
                         # pyrefly: ignore [missing-attribute]
