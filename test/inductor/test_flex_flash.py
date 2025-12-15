@@ -101,12 +101,18 @@ def create_dual_buffer_bias(num_heads=4, seq_len=512, dtype=torch.float16):
 
 
 def create_test_tensors(
-    batch_size=2, num_heads=4, seq_len=512, dim=64, dtype=torch.float16, device="cuda"
+    batch_size=2,
+    num_heads=4,
+    seq_len=512,
+    dim=64,
+    dtype=torch.float16,
+    device="cuda",
+    requires_grad=False,
 ):
     shape = (batch_size, num_heads, seq_len, dim)
-    q = torch.randn(shape, device=device, dtype=dtype, requires_grad=False)
-    k = torch.randn(shape, device=device, dtype=dtype, requires_grad=False)
-    v = torch.randn(shape, device=device, dtype=dtype, requires_grad=False)
+    q = torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
+    k = torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
+    v = torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
     return q, k, v
 
 
@@ -394,7 +400,7 @@ class TestFlexFlash(InductorTestCase):
         compiled_fn = torch.compile(flex_attention)
         with self.assertRaisesRegex(
             RuntimeError,
-            r"NYI: Flex Flash Attention doesn't support score_mods in bwds yet",
+            r"NYI: Flex Flash Attention bwd doesn't support captured buffers yet",
         ):
             compiled_fn(
                 q,
@@ -405,27 +411,28 @@ class TestFlexFlash(InductorTestCase):
             ).sum().backward()
 
     @dtypes(torch.float16, torch.bfloat16)
-    def test_flash_attention_backward_rejects_score_mod(self, device, dtype):
-        q, k, v = create_test_tensors(dtype=dtype, device=device)
+    def test_flash_attention_backward_with_score_mod(self, device, dtype):
+        """Test that score_mod backward works correctly with FLASH backend."""
+        q, k, v = create_test_tensors(
+            dtype=dtype, seq_len=257, device=device, requires_grad=True
+        )
 
         def score_mod_twice(score, b, h, q_idx, kv_idx):
             return score * 2
 
-        q.requires_grad_(True)
-        k.requires_grad_(True)
-        v.requires_grad_(True)
-        compiled_fn = torch.compile(flex_attention)
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"NYI: Flex Flash Attention doesn't support score_mods in bwds yet",
-        ):
-            compiled_fn(
-                q,
-                k,
-                v,
-                score_mod=score_mod_twice,
-                kernel_options={"BACKEND": "FLASH"},
-            ).sum().backward()
+        flash_vs_triton(q, k, v, score_mod=score_mod_twice)
+
+    @dtypes(torch.float16, torch.bfloat16)
+    def test_flash_attention_backward_with_score_squared(self, device, dtype):
+        """Test score**2 backward - requires correct score value for gradient."""
+        q, k, v = create_test_tensors(
+            dtype=dtype, seq_len=257, device=device, requires_grad=True
+        )
+
+        def score_mod_squared(score, b, h, q_idx, kv_idx):
+            return score * score
+
+        flash_vs_triton(q, k, v, score_mod=score_mod_squared)
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_flash_attention_backward_kernel_called(self, device, dtype):
