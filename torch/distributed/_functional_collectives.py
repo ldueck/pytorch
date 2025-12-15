@@ -172,6 +172,40 @@ def all_reduce(self: torch.Tensor, reduceOp: str, group: RANK_TYPES, tag: str = 
     return _maybe_wrap_tensor(tensor)
 
 
+def _maybe_view_chunk_cat(
+    res: torch.Tensor, group_size: int, gather_dim: int
+) -> torch.Tensor:
+    """
+    This is intuitively the same as torch.cat(torch.chunk(res, group_size,
+    dim=0), dim=gather_dim), but returns a view if data movement is not
+    necessary.  This operation arises in NCCL all_gather, where you always get
+    a result which is concatenated on dim=0, even though actually you may need
+    to undo this concatenation and then re-cat on the gather dim.
+
+    This is implemented in a clever way: we can express the chunk and cat purely
+    in terms of view operations.  A copy is not necessary if the resulting view
+    is still contiguous.
+
+    This function is only valid for contiguous tensors.
+
+    Example: shape [4, d1, d2] with group_size=4, gather_dim=1 -> [1, 4*d1, d2]
+    Example: shape [4, 2, d2] with group_size=4, gather_dim=2 -> [1, 2, 4*d2]
+
+    Args:
+        res: Tensor with gathered data in dim 0, shape [group_size, ...]
+        group_size: Number of ranks in the group
+        gather_dim: Dimension to gather along in the output
+
+    Returns:
+        Tensor with data rearranged to gather along gather_dim
+    """
+
+    chunks = torch.unflatten(res, 0, [group_size, -1])
+    return torch.flatten(
+        torch.movedim(chunks, 0, gather_dim), gather_dim, gather_dim + 1
+    )
+
+
 def all_gather_tensor(
     self: torch.Tensor,
     gather_dim: int,
@@ -208,7 +242,8 @@ def all_gather_tensor(
         # and then chunk + cat avoid us going through ACT dispatching logic again
         if isinstance(res, AsyncCollectiveTensor):
             res = res.wait()  # type: ignore[attr-defined]
-        res = torch.cat(torch.chunk(res, group_size, dim=0), dim=gather_dim)
+
+        res = _maybe_view_chunk_cat(res, group_size, gather_dim)
     return res
 
 
